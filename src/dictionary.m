@@ -480,6 +480,10 @@ xpc_object_t xpc_dictionary_create_reply(xpc_object_t xorig) {
 		dict.outgoingPort = orig.incomingPort;
 		orig.incomingPort = MACH_PORT_NULL;
 
+		// the reply is addressed through the connection the request arrived on
+		// (xpc_dictionary_get_remote_connection works on a reply, as on a received message)
+		dict.associatedConnection = orig.associatedConnection;
+
 		return dict;
 	}
 	return NULL;
@@ -650,7 +654,15 @@ void xpc_dictionary_set_data(xpc_object_t xdict, const char* key, const void* by
 
 XPC_EXPORT
 void xpc_dictionary_set_connection(xpc_object_t xdict, const char* key, xpc_connection_t connection) {
-	return xpc_dictionary_set_value(xdict, key, connection);
+	// a connection object itself cannot be serialized into a message; what
+	// the receiver turns back into a connection (xpc_dictionary_create_connection)
+	// is an endpoint of it
+	xpc_object_t endpoint = xpc_endpoint_create(connection);
+	if (endpoint == NULL) {
+		return;
+	}
+	xpc_dictionary_set_value(xdict, key, endpoint);
+	xpc_release(endpoint);
 };
 
 XPC_EXPORT
