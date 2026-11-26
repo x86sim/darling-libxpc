@@ -28,6 +28,8 @@
 #include <xpc/serialization.h>
 #import <objc/runtime.h>
 #include <Block.h>
+#include <signal.h>
+#include <bootstrap_priv.h>
 
 XPC_CLASS_SYMBOL_DECL(connection);
 
@@ -68,7 +70,7 @@ static void server_peer_array_item_dtor(XPC_CLASS(connection)** serverPeer) {
 	[*serverPeer release];
 };
 
-static xpc_connection_reply_context_t* xpc_connection_reply_context_create(xpc_handler_t handler, dispatch_queue_t queue) {
+static xpc_connection_reply_context_t* xpc_connection_reply_context_create(XPC_CLASS(connection)* connection, xpc_handler_t handler, dispatch_queue_t queue) {
 	xpc_connection_reply_context_t* context = malloc(sizeof(xpc_connection_reply_context_t));
 
 	if (queue == NULL) {
@@ -77,6 +79,8 @@ static xpc_connection_reply_context_t* xpc_connection_reply_context_create(xpc_h
 
 	context->handler = Block_copy(handler);
 	context->queue = [queue retain];
+	context->connection = connection;
+	_os_object_retain_internal(connection);
 
 	xpc_log_debug(connection, "created reply context %p (with handler %p and queue %p)", context, context->handler, context->queue);
 
@@ -85,9 +89,11 @@ static xpc_connection_reply_context_t* xpc_connection_reply_context_create(xpc_h
 
 static void xpc_connection_reply_context_destroy(xpc_connection_reply_context_t* context) {
 	xpc_log_debug(connection, "destroying reply context %p (with handler %p and queue %p)", context, context->handler, context->queue);
+	XPC_CLASS(connection)* connection = context->connection;
 	Block_release(context->handler);
 	[context->queue release];
 	free(context);
+	_os_object_release_internal(connection);
 };
 
 // returns `true` if there was no error, `false` otherwise
@@ -148,6 +154,47 @@ static bool handle_send_result(dispatch_mach_msg_t message, dispatch_mach_reason
 	return false;
 };
 
+// Swaps the handler slot under the lock; the caller releases the returned old block outside it.
+static xpc_handler_t exchange_event_handler(XPC_CLASS(connection)* self, xpc_handler_t newHandler) {
+	XPC_THIS_DECL(connection);
+	xpc_handler_t old = NULL;
+
+	pthread_mutex_lock(&this->event_handler_lock);
+	old = this->event_handler;
+	this->event_handler = newHandler;
+	pthread_mutex_unlock(&this->event_handler_lock);
+
+	return old;
+};
+
+// Calls the event handler that is current when the event is delivered. The block is retained under the same lock that
+// replacing it takes, so a replacement (from another thread, or from inside the handler itself) cannot free it between
+// being read and being retained, and it outlives its own body: what it captured stays alive until it returns.
+// A replacement made while a handler runs takes effect from the next event; it does not interrupt the running call.
+static void call_event_handler(XPC_CLASS(connection)* self, xpc_object_t event) {
+	XPC_THIS_DECL(connection);
+	xpc_handler_t handler = NULL;
+	bool log_missing = false;
+
+	pthread_mutex_lock(&this->event_handler_lock);
+	handler = Block_copy(this->event_handler);
+	if (!handler && !this->no_handler_logged) {
+		this->no_handler_logged = true;
+		log_missing = true;
+	}
+	pthread_mutex_unlock(&this->event_handler_lock);
+
+	if (handler) {
+		handler(event);
+		Block_release(handler);
+	} else if (log_missing) {
+		// Deliberately more lenient than macOS: macOS 26.7.3 traps in xpc_connection_resume when the connection has no
+		// event handler (black-box observation, tier 2). Here the event is dropped and the first one is logged, instead of
+		// calling a NULL block. Test: test/handler-lifetime.m (no-handler)
+		xpc_log_fault(connection, "connection %p (service %s) received an event but has no event handler; dropping events", self, this->service_name ? this->service_name : "(anonymous)");
+	}
+};
+
 static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, dispatch_mach_msg_t message, mach_error_t error) {
 	XPC_CLASS(connection)* self = context;
 	XPC_THIS_DECL(connection);
@@ -205,7 +252,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 				}
 				[self addServerPeer: serverPeer]; // takes ownership of the server peer connection
 
-				this->event_handler(serverPeer);
+				call_event_handler(self, serverPeer);
 			} else {
 				XPC_CLASS(dictionary)* dict = nil;
 				audit_token_t* token = NULL;
@@ -229,7 +276,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 					[dict setAssociatedAuditToken: token];
 				}
 
-				this->event_handler(dict);
+				call_event_handler(self, dict);
 			}
 		} break;
 
@@ -246,12 +293,11 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 			[self.parentServer removeServerPeer: self]; // server peers should unregister themselves from their parent servers
 			xpc_log_debug(connection, "connection %p: cancelled", self);
 
-			this->event_handler(XPC_ERROR_CONNECTION_INVALID);
+			call_event_handler(self, XPC_ERROR_CONNECTION_INVALID);
 
 			// we're never going to call the event handler again, so release it;
 			// if they were holding a reference on us, it gets released
-			Block_release(this->event_handler);
-			this->event_handler = NULL;
+			Block_release(exchange_event_handler(self, NULL));
 
 			// the channel is finished with our ports; give them up now rather than in -dealloc, which may be much later
 			// if the user keeps their reference. this is what tells the other end that the connection is gone.
@@ -314,7 +360,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 				dispatch_mach_reconnect(this->mach_ctx, this->send_port, checkinMessage);
 
 				// let the user know that the connection got wonky
-				this->event_handler(XPC_ERROR_CONNECTION_INTERRUPTED);
+				call_event_handler(self, XPC_ERROR_CONNECTION_INTERRUPTED);
 			}
 		} break;
 
@@ -327,7 +373,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 		} break;
 
 		case DISPATCH_MACH_SIGTERM_RECEIVED: {
-			this->event_handler(XPC_ERROR_TERMINATION_IMMINENT);
+			call_event_handler(self, XPC_ERROR_TERMINATION_IMMINENT);
 		} break;
 
 		default: {
@@ -368,9 +414,12 @@ static dispatch_queue_t dmxh_msg_context_reply_queue(void* msg_context) {
 };
 
 static void dmxh_async_reply_handler(void* self_context, dispatch_mach_reason_t reason, dispatch_mach_msg_t message) {
-	XPC_CLASS(connection)* self = self_context;
-	XPC_THIS_DECL(connection);
 	xpc_connection_reply_context_t* context = dispatch_get_context(message);
+	// Not `self_context`: once the last user reference to the connection is
+	// released, libdispatch passes a poisoned value there for the replies that
+	// were still pending.
+	XPC_CLASS(connection)* self = context->connection;
+	XPC_THIS_DECL(connection);
 	xpc_object_t result = NULL;
 	mach_msg_header_t* header = dispatch_mach_msg_get_msg(message, NULL);
 	mach_port_t localPort = header->msgh_local_port;
@@ -399,10 +448,17 @@ static void dmxh_async_reply_handler(void* self_context, dispatch_mach_reason_t 
 			}
 
 			[message retain]; // because the deserializer consumes a reference on the message
-			result = [XPC_CLASS(deserializer) process: message];
-			if (!result) {
+			XPC_CLASS(dictionary)* reply = [XPC_CLASS(deserializer) process: message];
+			if (!reply) {
 				xpc_abort("failed to deserialize reply");
 			}
+			// QUIRK: a reply reports the connection it arrived on, like a received message does. The documentation covers
+			// only dictionaries received by an event handler and created by xpc_dictionary_create_reply. Evidence:
+			// black-box observation on macOS 26.7.3 (tier 2): in-process anonymous listener and client, the reply given to
+			// a reply handler and the result of xpc_connection_send_message_with_reply_sync both report the client
+			// connection. Test: test/reply-remote-connection.c
+			reply.associatedConnection = self;
+			result = reply;
 			// `header` is no longer valid
 		} break;
 
@@ -483,9 +539,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 
 - (void)setEventHandler: (xpc_handler_t)eventHandler
 {
-	XPC_THIS_DECL(connection);
-	Block_release(this->event_handler);
-	this->event_handler = Block_copy(eventHandler);
+	Block_release(exchange_event_handler(self, Block_copy(eventHandler)));
 }
 
 - (xpc_finalizer_t)finalizer
@@ -598,6 +652,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 	pthread_rwlock_destroy(&this->activated_lock);
 	pthread_rwlock_destroy(&this->server_peers_lock);
 	pthread_rwlock_destroy(&this->remote_credentials_lock);
+	pthread_mutex_destroy(&this->event_handler_lock);
 
 	xpc_assumes_zero(xpc_mach_port_release_send(this->send_port));
 	xpc_assumes_zero(xpc_mach_port_release_send(this->checkin_port));
@@ -633,6 +688,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 	pthread_rwlock_init(&this->activated_lock, NULL);
 	pthread_rwlock_init(&this->server_peers_lock, NULL);
 	pthread_rwlock_init(&this->remote_credentials_lock, NULL);
+	pthread_mutex_init(&this->event_handler_lock, NULL);
 
 	this->suspension_count = 1;
 
@@ -796,7 +852,15 @@ OS_OBJECT_USES_XREF_DISPOSE();
 		xpc_assert(MACH_PORT_VALID(this->recv_port));
 	} else if (this->service_name) {
 		// client for named server
-		status = bootstrap_look_up(bootstrap_port, this->service_name, &this->checkin_port);
+		xpc_bundle_services_register_loaded();
+		if (this->has_instance) {
+			// launchd starts a process for each instance of a service that
+			// declares multiple instances, and gives the same one to all
+			// lookups of an instance.
+			status = bootstrap_look_up3(bootstrap_port, this->service_name, &this->checkin_port, 0, this->instance, BOOTSTRAP_SPECIFIC_INSTANCE);
+		} else {
+			status = bootstrap_look_up(bootstrap_port, this->service_name, &this->checkin_port);
+		}
 		if (status != KERN_SUCCESS) {
 			xpc_log_error(connection, "failed to lookup service with name \"%s\"", this->service_name);
 			goto invalid_out;
@@ -1011,7 +1075,7 @@ invalid_out:
 			xpc_abort("failed to finalize message");
 		}
 
-		context = xpc_connection_reply_context_create(handler, queue);
+		context = xpc_connection_reply_context_create(self, handler, queue);
 		dispatch_set_context(message, context);
 
 		dispatch_mach_send_with_result_and_async_reply_4libxpc(this->mach_ctx, message, 0, 0, &sendResult, &sendError);
@@ -1082,6 +1146,8 @@ invalid_out:
 		// give it its own autoreleasepool to reduce memory usage
 		// (to ensure that the serializer from before is released)
 		result = [[XPC_CLASS(deserializer) process: reply] retain];
+		// QUIRK: see dmxh_async_reply_handler
+		result.associatedConnection = self;
 	}
 
 	return result;
@@ -1305,9 +1371,24 @@ void xpc_connection_set_target_uid(xpc_connection_t xconn, uid_t uid) {
 	xpc_stub();
 };
 
+// Selects the instance of a service that declares _MultipleInstances, by UUID.
+// Connections with the same UUID reach the same process, as on macOS 26.7.3
+// (test framework-xpc-instances.c).
+static void xpc_connection_select_instance(xpc_connection_t xconn, const uint8_t* uuid) {
+	TO_OBJC_CHECKED(connection, xconn, conn) {
+		struct xpc_connection_s* this = (struct xpc_connection_s*)conn;
+		if (uuid == NULL) {
+			this->has_instance = false;
+			return;
+		}
+		uuid_copy(this->instance, uuid);
+		this->has_instance = true;
+	}
+}
+
 XPC_EXPORT
 void xpc_connection_set_instance(xpc_connection_t xconn, uuid_t uuid) {
-	xpc_stub();
+	xpc_connection_select_instance(xconn, uuid);
 };
 
 XPC_EXPORT
@@ -1364,7 +1445,14 @@ uint8_t xpc_connection_get_bs_type(xpc_connection_t xconn) {
 
 XPC_EXPORT
 void xpc_connection_get_instance(xpc_connection_t xconn, uint8_t* out_uuid) {
-	xpc_stub();
+	TO_OBJC_CHECKED(connection, xconn, conn) {
+		struct xpc_connection_s* this = (struct xpc_connection_s*)conn;
+		if (this->has_instance) {
+			uuid_copy(out_uuid, this->instance);
+		} else {
+			uuid_clear(out_uuid);
+		}
+	}
 };
 
 XPC_EXPORT
@@ -1372,9 +1460,15 @@ bool xpc_connection_is_extension(xpc_connection_t xconn) {
 	return false;
 };
 
+// Sends a signal to the process at the other end of the connection
+// (test framework-xpc-instances.c). Its process ID is known once a message
+// from it has arrived; before that there is nobody to signal.
 XPC_EXPORT
 void xpc_connection_kill(xpc_connection_t xconn, int signal) {
-	xpc_stub();
+	pid_t pid = xpc_connection_get_pid(xconn);
+	if (pid > 0) {
+		kill(pid, signal);
+	}
 };
 
 XPC_EXPORT
@@ -1412,7 +1506,7 @@ void __xpc_connection_set_logging(xpc_connection_t xconn, bool enabled) {
 
 XPC_EXPORT
 void xpc_connection_set_oneshot_instance(xpc_connection_t xconn, const uint8_t* uuid) {
-	xpc_stub();
+	xpc_connection_select_instance(xconn, uuid);
 };
 
 XPC_EXPORT
